@@ -145,7 +145,7 @@ int main(int argc, char const *argv[])
     double accuracy = vm["accuracy"].as<double>();
     int countIter = vm["iterCount"].as<int>();
    
-    cudaError_t crush;
+    
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     cudaGraph_t     graph;
@@ -187,7 +187,7 @@ int main(int argc, char const *argv[])
 
 
 
-    dim3 threads_in_block = dim3(8, 8);
+    dim3 threads_in_block = dim3(32, 32);
     dim3 blocks_in_grid((N + threads_in_block.x - 1) / threads_in_block.x, (N + threads_in_block.y - 1) / threads_in_block.y);
 
 
@@ -197,7 +197,7 @@ int main(int argc, char const *argv[])
     
         // 99 - считаем ошибку через 100 итераций
 
-    for(size_t i =0 ; i<990;i++){
+    for(size_t i =0 ; i<999;i++){
         
         // cudaDeviceSynchronize();
         computeOneIteration<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,N);
