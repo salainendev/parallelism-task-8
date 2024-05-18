@@ -33,6 +33,13 @@ double linearInterpolation(double x, double x1, double y1, double x2, double y2)
 
 void initMatrix(std::unique_ptr<double[]> &arr ,int N){
         
+        for (size_t i = 0; i < N*N-1; i++)
+        {
+            arr[i] = 0;
+        }
+        
+
+
           arr[0] = 10.0;
           arr[N-1] = 20.0;
           arr[(N-1)*N + (N-1)] = 30.0;
@@ -76,6 +83,7 @@ void swapMatrices(double* &prevmatrix, double* &curmatrix) {
     double* temp = prevmatrix;
     prevmatrix = curmatrix;
     curmatrix = temp;
+    
 }
 
 
@@ -88,23 +96,23 @@ __global__ void computeOneIteration(double *prevmatrix, double *curmatrix, int s
     int j = blockIdx.x * blockDim.x + threadIdx.x;
 
     // чтобы не изменять границы
-    if (j == 0 || i == 0 || i >= size-1 || j >= size-1)
-        return;
+    if (!(j == 0 || i == 0 || i >= size-1 || j >= size-1))
+        curmatrix[i*size+j]  = 0.25 * (prevmatrix[i*size+j+1] + prevmatrix[i*size+j-1] + prevmatrix[(i-1)*size+j] + prevmatrix[(i+1)*size+j]);
+        
 
-    curmatrix[i*size+j]  = 0.25 * (prevmatrix[i*size+j+1] + prevmatrix[i*size+j-1] + prevmatrix[(i-1)*size+j] + prevmatrix[(i+1)*size+j]);
 }
 
 
 // вычитание из матрицы, результат сохраняем в матрицу пред. значений
-__global__ void matrixSub(double *prevmatrix, double *curmatrix,int size){
+__global__ void matrixSub(double *prevmatrix, double *curmatrix,double *error,int size){
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
 
     // чтобы не изменять границы
-    if (j == 0 || i == 0 || i >= size-1 || j >= size-1)
-        return;
+    // if (!(j == 0 || i == 0 || i >= size-1 || j >= size-1))
+        error[i*size + j] = fabs(curmatrix[i*size+j] - prevmatrix[i*size+j]);
+        
 
-    prevmatrix[i*size + j] = curmatrix[i*size+j] - prevmatrix[i*size+j];
 }
 
 
@@ -143,58 +151,71 @@ int main(int argc, char const *argv[])
     cudaGraph_t     graph;
     cudaGraphExec_t g_exec;
 
-    double *prevmatrix_GPU;
-    double *error_GPU;
+    double *prevmatrix_GPU  = NULL;
+    double *error_GPU  = NULL;
     // tmp будет буфером для хранения результатов редукции , по блокам и общий
     double *tmp=NULL;
     size_t tmp_size = 0;
-    double *curmatrix_GPU;
+    double *curmatrix_GPU = NULL;
 
-    double error = 1.0;
+    double error =1.0;
     int iter = 0;
 
     std::unique_ptr<double[]> A(new double[N*N]);
     std::unique_ptr<double[]> Anew(new double[N*N]);
-    
+    std::unique_ptr<double[]> B(new double[N*N]);
 
     initMatrix(std::ref(A),N);
     initMatrix(std::ref(Anew),N);
-   
+    
     double* curmatrix = A.get();
     double* prevmatrix = Anew.get();
-
+    double* error_matrix = B.get();
+    double* error_gpu;
     CHECK(cudaMalloc(&curmatrix_GPU,sizeof(double)*N*N));
     CHECK(cudaMalloc(&prevmatrix_GPU,sizeof(double)*N*N));
+    CHECK(cudaMalloc(&error_gpu,sizeof(double)*N*N));
     CHECK(cudaMalloc(&error_GPU,sizeof(double)*1));
     CHECK(cudaMemcpy(curmatrix_GPU,curmatrix,N*N*sizeof(double),cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(prevmatrix_GPU,prevmatrix,N*N*sizeof(double),cudaMemcpyHostToDevice));
-
-
-    cub::DeviceReduce::Max(tmp,tmp_size,prevmatrix_GPU,error_GPU,N*N,stream);
+    CHECK(cudaMemcpy(error_gpu,error_matrix,N*N*sizeof(double),cudaMemcpyHostToDevice));
+    
+    
+    cub::DeviceReduce::Max(tmp,tmp_size,prevmatrix_GPU,error_GPU,N*N);
 
     CHECK(cudaMalloc(&tmp,tmp_size));
-    dim3 blocks_in_grid   = dim3(N*N/32, N*N / 32);
-    dim3 threads_in_block = dim3(32, 32);
+
+
+
+    dim3 threads_in_block = dim3(8, 8);
+    dim3 blocks_in_grid((N + threads_in_block.x - 1) / threads_in_block.x, (N + threads_in_block.y - 1) / threads_in_block.y);
 
 
 
 // начало записи вычислительного графа
     cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal);
     
-        // 100 - считаем ошибку через 100 итераций
+        // 99 - считаем ошибку через 100 итераций
 
-    for(size_t i =0 ; i<100;i++){
-        cudaDeviceSynchronize();
+    for(size_t i =0 ; i<990;i++){
+        
+        // cudaDeviceSynchronize();
+        computeOneIteration<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,N);
         swapMatrices(prevmatrix_GPU,curmatrix_GPU);
-        cudaDeviceSynchronize();
+        // cudaDeviceSynchronize();
+        // cudaMemcpy(prevmatrix_GPU,curmatrix_GPU,N*N*sizeof(double),cudaMemcpyDeviceToDevice);
 
-        computeOneIteration<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,N*N);
     }
+
+    computeOneIteration<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,N);
+    matrixSub<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,error_gpu,N);
     
-    matrixSub<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,N*N);
-    
-    cub::DeviceReduce::Max(tmp,tmp_size,prevmatrix_GPU,error_GPU,N*N,stream);
+
+
+    // cudaDeviceSynchronize();
+    cub::DeviceReduce::Max(tmp,tmp_size,error_gpu,error_GPU,N*N,stream);
     cudaStreamEndCapture(stream, &graph);
+
 
     // закончили построение выч. графа
     
@@ -203,14 +224,20 @@ int main(int argc, char const *argv[])
     cudaGraphInstantiate(&g_exec, graph, NULL, NULL, 0);
 
     auto start = std::chrono::high_resolution_clock::now();
-    while(error>accuracy && iter < countIter){
+    while(error > accuracy && iter < countIter){
         cudaGraphLaunch(g_exec,stream);
+        // matrixSub<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,error_gpu,N);
+        // cub::DeviceReduce::Max(tmp,tmp_size,error_gpu,error_GPU,N*N,stream);
+        // cudaDeviceSynchronize();
         cudaMemcpy(&error,error_GPU,1*sizeof(double),cudaMemcpyDeviceToHost);
-        iter+=99;
-        std::cout << "iteration: "<<iter+1 << ' ' <<"error: "<<error << std::endl;
+        iter+=1000;
+        std::cout << "iteration: "<<iter << ' ' <<"error: "<<error << std::endl;
 
     }
     
+    
+
+
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end - start;
     auto time_s = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -218,6 +245,8 @@ int main(int argc, char const *argv[])
     
     std::cout<<"time: " << time_s<<" error: "<<error << " iterarion: " << iter<<std::endl;
     
+    CHECK(cudaMemcpy(prevmatrix,prevmatrix_GPU,sizeof(double)*N*N,cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(error_matrix,error_gpu,sizeof(double)*N*N,cudaMemcpyDeviceToHost));
 
     CHECK(cudaMemcpy(curmatrix,curmatrix_GPU,sizeof(double)*N*N,cudaMemcpyDeviceToHost));
     if (N <=13){
@@ -232,8 +261,20 @@ int main(int argc, char const *argv[])
             }
             std::cout << std::endl;
         }
+
+        for (size_t i = 0; i < N; i++)
+        {
+            for (size_t j = 0; j < N; j++)
+            {
+                /* code */
+                std::cout << Anew[i*N+j] << ' ';
+                
+            }
+            std::cout << std::endl;
+        }
+
     }
-    saveMatrixToFile(std::ref(curmatrix), N , "matrix.txt");
+    saveMatrixToFile(curmatrix, N , "matrix.txt");
     cudaStreamDestroy(stream);
     cudaGraphDestroy(graph);
     cudaFree(prevmatrix_GPU);
