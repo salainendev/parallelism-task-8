@@ -12,6 +12,64 @@ namespace opt = boost::program_options;
 #include <cub/cub.cuh>
 
 
+// cuda unique_ptr
+template<typename T>
+using cuda_unique_ptr = std::unique_ptr<T,std::function<void(T*)>>;
+
+// new
+template<typename T>
+T* cuda_new(size_t size)
+{
+    T *d_ptr;
+    cudaMalloc((void **)&d_ptr, sizeof(T) * size);
+    return d_ptr;
+}
+
+// delete
+template<typename T>
+void cuda_delete(T *dev_ptr)
+{
+    cudaFree(dev_ptr);
+}
+
+cudaStream_t* cuda_new_stream()
+{
+    cudaStream_t* stream = new cudaStream_t;
+    cudaStreamCreate(stream);
+    return stream;
+}
+
+void cuda_delete_stream(cudaStream_t* stream)
+{
+    cudaStreamDestroy(*stream);
+    delete stream;
+}
+
+cudaGraph_t* cuda_new_graph()
+{
+    cudaGraph_t* graph = new cudaGraph_t;
+    return graph;
+}
+
+void cuda_delete_graph(cudaGraph_t* graph)
+{
+    cudaGraphDestroy(*graph);
+    delete graph;
+}
+
+cudaGraphExec_t* cuda_new_graph_exec()
+{
+    cudaGraphExec_t* graphExec = new cudaGraphExec_t;
+    return graphExec;
+}
+
+void cuda_delete_graph_exec(cudaGraphExec_t* graphExec)
+{
+    cudaGraphExecDestroy(*graphExec);
+    delete graphExec;
+}
+
+
 #define CHECK(call)                                                             \
     {                                                                           \
         const cudaError_t error = call;                                         \
@@ -109,7 +167,7 @@ __global__ void matrixSub(double *prevmatrix, double *curmatrix,double *error,in
     int j = blockIdx.x * blockDim.x + threadIdx.x;
 
     // чтобы не изменять границы
-    // if (!(j == 0 || i == 0 || i >= size-1 || j >= size-1))
+    if (!(j == 0 || i == 0 || i >= size-1 || j >= size-1))
         error[i*size + j] = fabs(curmatrix[i*size+j] - prevmatrix[i*size+j]);
         
 
@@ -146,17 +204,19 @@ int main(int argc, char const *argv[])
     int countIter = vm["iterCount"].as<int>();
    
     
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-    cudaGraph_t     graph;
-    cudaGraphExec_t g_exec;
-
-    double *prevmatrix_GPU  = NULL;
-    double *error_GPU  = NULL;
+    // cudaStream_t stream;
+    // cudaStreamCreate(&stream);
+    
+    cuda_unique_ptr<cudaStream_t> stream(cuda_new_stream(),cuda_delete_stream);
+    cuda_unique_ptr<cudaGraph_t>graph(cuda_new_graph(),cuda_delete_graph);
+    cuda_unique_ptr<cudaGraphExec_t>g_exec(cuda_new_graph_exec(),cuda_delete_graph_exec);
+    // cudaStream_t* stream = (stream_ptr.get());
+    // double *prevmatrix_GPU  = NULL;
+    // double *error_GPU  = NULL;
     // tmp будет буфером для хранения результатов редукции , по блокам и общий
-    double *tmp=NULL;
     size_t tmp_size = 0;
-    double *curmatrix_GPU = NULL;
+    // double *curmatrix_GPU = NULL;
+    double* tmp = NULL;
 
     double error =1.0;
     int iter = 0;
@@ -171,11 +231,22 @@ int main(int argc, char const *argv[])
     double* curmatrix = A.get();
     double* prevmatrix = Anew.get();
     double* error_matrix = B.get();
-    double* error_gpu;
-    CHECK(cudaMalloc(&curmatrix_GPU,sizeof(double)*N*N));
-    CHECK(cudaMalloc(&prevmatrix_GPU,sizeof(double)*N*N));
-    CHECK(cudaMalloc(&error_gpu,sizeof(double)*N*N));
-    CHECK(cudaMalloc(&error_GPU,sizeof(double)*1));
+    // double* error_gpu;
+    // CHECK(cudaMalloc(&curmatrix_GPU,sizeof(double)*N*N));
+    // CHECK(cudaMalloc(&prevmatrix_GPU,sizeof(double)*N*N));
+    // CHECK(cudaMalloc(&error_gpu,sizeof(double)*N*N));
+    // CHECK(cudaMalloc(&error_GPU,sizeof(double)*1));
+    cuda_unique_ptr<double> curmatrix_GPU_ptr(cuda_new<double>(N*N),cuda_delete<double>);
+    cuda_unique_ptr<double> prevmatrix_GPU_ptr(cuda_new<double>(N*N),cuda_delete<double>);
+    cuda_unique_ptr<double> error_gpu_ptr(cuda_new<double>(N*N),cuda_delete<double>);
+    cuda_unique_ptr<double>error_GPU_ptr(cuda_new<double>(1),cuda_delete<double>);
+    // 
+    double* curmatrix_GPU = curmatrix_GPU_ptr.get();
+    double* prevmatrix_GPU = prevmatrix_GPU_ptr.get();
+    double* error_gpu = error_gpu_ptr.get();
+    double* error_GPU = error_GPU_ptr.get();
+
+
     CHECK(cudaMemcpy(curmatrix_GPU,curmatrix,N*N*sizeof(double),cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(prevmatrix_GPU,prevmatrix,N*N*sizeof(double),cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(error_gpu,error_matrix,N*N*sizeof(double),cudaMemcpyHostToDevice));
@@ -183,8 +254,9 @@ int main(int argc, char const *argv[])
     
     cub::DeviceReduce::Max(tmp,tmp_size,prevmatrix_GPU,error_GPU,N*N);
 
-    CHECK(cudaMalloc(&tmp,tmp_size));
-
+    cuda_unique_ptr<double>tmp_ptr(cuda_new<double>(tmp_size),cuda_delete<double>);
+    // CHECK(cudaMalloc(&tmp,tmp_size));
+    tmp = tmp_ptr.get();
 
 
     dim3 threads_in_block = dim3(32, 32);
@@ -193,39 +265,39 @@ int main(int argc, char const *argv[])
 
 
 // начало записи вычислительного графа
-    cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal);
+    cudaStreamBeginCapture(*stream,cudaStreamCaptureModeGlobal);
     
-        // 99 - считаем ошибку через 100 итераций
+        // 999 + 1 - считаем ошибку через 1000 итераций
 
     for(size_t i =0 ; i<999;i++){
         
         // cudaDeviceSynchronize();
-        computeOneIteration<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,N);
+        computeOneIteration<<<blocks_in_grid, threads_in_block,0,*stream>>>(prevmatrix_GPU,curmatrix_GPU,N);
         swapMatrices(prevmatrix_GPU,curmatrix_GPU);
         // cudaDeviceSynchronize();
         // cudaMemcpy(prevmatrix_GPU,curmatrix_GPU,N*N*sizeof(double),cudaMemcpyDeviceToDevice);
 
     }
 
-    computeOneIteration<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,N);
-    matrixSub<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,error_gpu,N);
+    computeOneIteration<<<blocks_in_grid, threads_in_block,0,*stream>>>(prevmatrix_GPU,curmatrix_GPU,N);
+    matrixSub<<<blocks_in_grid, threads_in_block,0,*stream>>>(prevmatrix_GPU,curmatrix_GPU,error_gpu,N);
     
 
 
     // cudaDeviceSynchronize();
-    cub::DeviceReduce::Max(tmp,tmp_size,error_gpu,error_GPU,N*N,stream);
-    cudaStreamEndCapture(stream, &graph);
+    cub::DeviceReduce::Max(tmp,tmp_size,error_gpu,error_GPU,N*N,*stream);
+    cudaStreamEndCapture(*stream, graph.get());
 
 
     // закончили построение выч. графа
     
     
     // получили экземпляр выч.графа
-    cudaGraphInstantiate(&g_exec, graph, NULL, NULL, 0);
+    cudaGraphInstantiate(g_exec.get(), *graph, NULL, NULL, 0);
 
     auto start = std::chrono::high_resolution_clock::now();
     while(error > accuracy && iter < countIter){
-        cudaGraphLaunch(g_exec,stream);
+        cudaGraphLaunch(*g_exec,*stream);
         // matrixSub<<<blocks_in_grid, threads_in_block,0,stream>>>(prevmatrix_GPU,curmatrix_GPU,error_gpu,N);
         // cub::DeviceReduce::Max(tmp,tmp_size,error_gpu,error_GPU,N*N,stream);
         // cudaDeviceSynchronize();
@@ -275,16 +347,11 @@ int main(int argc, char const *argv[])
 
     }
     saveMatrixToFile(curmatrix, N , "matrix.txt");
-    cudaStreamDestroy(stream);
-    cudaGraphDestroy(graph);
-    cudaFree(prevmatrix_GPU);
-    cudaFree(curmatrix_GPU);
-    cudaFree(tmp);
-    cudaFree(error_GPU);
-    A = nullptr;
-    Anew = nullptr;
+    
+
 
     
+   
     
 
     return 0;
